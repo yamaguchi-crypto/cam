@@ -320,6 +320,21 @@
   }
   #detect-indicator.hidden { opacity: 0; }
 
+  /* カメラ切り替えボタン */
+  #flip-btn {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.3);
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.7);
+    font-size: 20px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    transition: all 0.2s;
+  }
+  #flip-btn:active { background: rgba(255,255,255,0.15); }
+
   /* モード別アクセントカラー */
   body.mode-trace { --accent: #00ffcc; }
   body.mode-particle { --accent: #ff2d6b; }
@@ -379,14 +394,16 @@
           <input type="range" id="glow-slider" min="0" max="100" value="70">
         </div>
       </div>
-      <button id="rec-btn"></button>
+      <div style="display:flex;gap:20px;align-items:center;">
+        <button id="flip-btn">⇄</button>
+        <button id="rec-btn"></button>
+      </div>
     </div>
   </div>
 
   <!-- パーミッション画面 -->
   <div id="perm-overlay">
     <h1>RHIZO<em>CAM</em></h1>
-    <p>BODY × DATA × ALGORITHM<br>手の動きをリアルタイムで<br>アルゴリズミックに拡張します</p>
     <button id="start-btn">START CAMERA</button>
   </div>
 
@@ -775,10 +792,47 @@ function colorWithAlpha(hex, alpha) {
 let handsInstance = null;
 let latestResults = null;
 let animId = null;
+let currentFacing = 'user'; // 'user'=内カメラ / 'environment'=外カメラ
+let currentStream = null;
+let mpCamera = null;
+let initialized = false;
 
 function renderLoop() {
   drawFrame(latestResults);
   animId = requestAnimationFrame(renderLoop);
+}
+
+async function startCamera(facingMode) {
+  // 既存ストリームを停止
+  if (currentStream) {
+    currentStream.getTracks().forEach(t => t.stop());
+    currentStream = null;
+  }
+  if (mpCamera) {
+    mpCamera.stop();
+    mpCamera = null;
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  currentStream = stream;
+  video.srcObject = stream;
+  await new Promise(r => { video.onloadedmetadata = r; });
+  video.play();
+
+  // 軌跡リセット
+  Object.keys(trails).forEach(k => delete trails[k]);
+  particles.length = 0;
+
+  mpCamera = new Camera(video, {
+    onFrame: async () => {
+      if (handsInstance) await handsInstance.send({ image: video });
+    },
+    width: 1280, height: 720,
+  });
+  mpCamera.start();
 }
 
 async function initMediaPipe() {
@@ -786,13 +840,7 @@ async function initMediaPipe() {
   document.getElementById('loading').style.display = 'flex';
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false,
-    });
-    video.srcObject = stream;
-    await new Promise(r => { video.onloadedmetadata = r; });
-    video.play();
+    await startCamera(currentFacing);
   } catch(e) {
     alert('カメラへのアクセスが必要です: ' + e.message);
     document.getElementById('perm-overlay').style.display = 'flex';
@@ -800,39 +848,41 @@ async function initMediaPipe() {
     return;
   }
 
-  // Hands 初期化
-  handsInstance = new Hands({
-    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-  });
-
-  handsInstance.setOptions({
-    maxNumHands: 2,
-    modelComplexity: 1,
-    minDetectionConfidence: 0.7,
-    minTrackingConfidence: 0.6,
-  });
-
-  handsInstance.onResults(results => {
-    latestResults = results;
-  });
-
-  // カメラユーティリティで自動フレーム送信
-  const cam = new Camera(video, {
-    onFrame: async () => {
-      await handsInstance.send({ image: video });
-    },
-    width: 1280, height: 720,
-  });
-  cam.start();
+  if (!initialized) {
+    // Hands 初期化（一度だけ）
+    handsInstance = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
+    });
+    handsInstance.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.6,
+    });
+    handsInstance.onResults(results => { latestResults = results; });
+    initialized = true;
+    renderLoop();
+  }
 
   document.getElementById('loading').style.display = 'none';
-
-  // レンダーループ開始
-  renderLoop();
 }
 
 // ─── UI イベント ──────────────────────────────────────────
 document.getElementById('start-btn').addEventListener('click', initMediaPipe);
+
+// カメラ切り替え
+document.getElementById('flip-btn').addEventListener('click', async () => {
+  if (!initialized) return;
+  currentFacing = currentFacing === 'user' ? 'environment' : 'user';
+  latestResults = null;
+  try {
+    await startCamera(currentFacing);
+  } catch(e) {
+    // 切り替え失敗時は元に戻す
+    currentFacing = currentFacing === 'user' ? 'environment' : 'user';
+    await startCamera(currentFacing);
+  }
+});
 
 // モードボタン
 document.querySelectorAll('.mode-btn').forEach(btn => {
