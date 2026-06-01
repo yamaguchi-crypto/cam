@@ -1,926 +1,250 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>RhizoCam</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Sans+JP:wght@100;300&display=swap');
+// ============================================================
+// 楽天レビュー要約機能（src/index.js に追加するモジュール）
+// ============================================================
+//
+// 【wrangler.jsonc に追加が必要な設定】
+//   "ai": { "binding": "AI" }
+//   （Workers AI を env.AI で使えるようにするバインディング）
+//
+// 【npm 依存（EUC-JP保険用 / 純JS・Workers動作可）】
+//   npm i encoding-japanese
+//
+// 【ルーティングへの組み込み（既存の fetch ハンドラ内に1行追加）】
+//   if (url.pathname === "/api/summarize-review" && request.method === "GET") {
+//     return handleSummarizeReview(request, env);
+//   }
+// ============================================================
 
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+import Encoding from "encoding-japanese";
 
-  :root {
-    --accent: #00ffcc;
-    --accent2: #ff2d6b;
-    --accent3: #7b2fff;
-    --bg: #000;
-    --text: rgba(255,255,255,0.85);
-    --mono: 'Share Tech Mono', monospace;
-  }
+// --- 設定（環境に合わせて調整） ---------------------------------
+const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+//  ↑ モデルIDは https://developers.cloudflare.com/workers-ai/models/ で最新を確認。
+//    レビュー件数を多く入れたい場合は 32k コンテキストの Mistral 系に変更すると安定:
+//    例: "@cf/mistralai/mistral-7b-instruct-v0.2"
 
-  html, body {
-    width: 100%; height: 100%;
-    background: #000;
-    color: var(--text);
-    font-family: var(--mono);
-    overflow: hidden;
-    touch-action: none;
-  }
+const MAX_PAGES = 2;            // 取得する楽天レビューのページ数（ニューロン節約のため少なめ推奨）
+const REVIEW_CHAR_LIMIT = 3000; // AIに渡すレビュー本文の最大文字数（8Bは4096トークン上限なので控えめ）
+const MAX_REVIEWS = 40;         // 取り込む最大レビュー件数
 
-  #app {
-    position: relative;
-    width: 100vw; height: 100vh;
-  }
+// ============================================================
+// ① charset自動判定つき fetch（UTF-8/EUC-JP/Shift_JIS対応）
+// ============================================================
+async function fetchHtmlSmart(targetUrl) {
+  const res = await fetch(targetUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; ReviewSummaryBot/1.0)",
+      "Accept-Language": "ja,en;q=0.8",
+      "Accept": "text/html",
+    },
+  });
+  if (!res.ok) throw new Error("ページ取得失敗 HTTP " + res.status);
 
-  /* カメラ映像（非表示、処理用） */
-  #video {
-    position: absolute;
-    width: 1px; height: 1px;
-    opacity: 0;
-    pointer-events: none;
-  }
+  const buf = new Uint8Array(await res.arrayBuffer());
 
-  /* メインキャンバス */
-  #canvas {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%; height: 100%;
-    image-rendering: pixelated;
-  }
-
-  /* HUD オーバーレイ */
-  #hud {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%; height: 100%;
-    pointer-events: none;
-    z-index: 10;
+  // charset判定: Content-Type ヘッダ → HTML内のmetaタグ の順
+  const ctype = res.headers.get("content-type") || "";
+  let charset = (ctype.match(/charset=([\w-]+)/i)?.[1] || "").toLowerCase();
+  if (!charset) {
+    const head = new TextDecoder("utf-8", { fatal: false }).decode(buf.slice(0, 2048));
+    charset = (head.match(/charset=["']?([\w-]+)/i)?.[1] || "utf-8").toLowerCase();
   }
 
-  /* ヘッダー */
-  #header {
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    padding: 20px 24px 0;
+  // UTF-8 はそのまま（Workers標準でOK）
+  if (charset === "utf-8" || charset === "utf8" || charset === "") {
+    return new TextDecoder("utf-8").decode(buf);
   }
 
-  #logo {
-    font-size: 11px;
-    letter-spacing: 0.4em;
-    color: var(--accent);
-    text-transform: uppercase;
-    line-height: 1.6;
-  }
-  #logo span {
-    display: block;
-    font-size: 18px;
-    letter-spacing: 0.2em;
-    color: #fff;
-  }
-
-  #status-panel {
-    text-align: right;
-    font-size: 10px;
-    letter-spacing: 0.15em;
-    color: rgba(255,255,255,0.4);
-    line-height: 2;
-  }
-  #status-panel .val {
-    color: var(--accent);
-  }
-
-  /* モード選択バー */
-  #mode-bar {
-    position: absolute;
-    top: 80px; left: 0; right: 0;
-    display: flex;
-    justify-content: center;
-    gap: 6px;
-    padding: 0 20px;
-    pointer-events: all;
-  }
-
-  .mode-btn {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.1);
-    color: rgba(255,255,255,0.4);
-    font-family: var(--mono);
-    font-size: 9px;
-    letter-spacing: 0.2em;
-    padding: 6px 12px;
-    cursor: pointer;
-    transition: all 0.2s;
-    text-transform: uppercase;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .mode-btn.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(0,255,204,0.08);
-    box-shadow: 0 0 12px rgba(0,255,204,0.2);
-  }
-  .mode-btn:hover { border-color: rgba(255,255,255,0.3); color: rgba(255,255,255,0.7); }
-
-  /* コーナーの装飾 */
-  .corner {
-    position: absolute;
-    width: 20px; height: 20px;
-    pointer-events: none;
-  }
-  .corner-tl { top: 10px; left: 10px; border-top: 1px solid var(--accent); border-left: 1px solid var(--accent); }
-  .corner-tr { top: 10px; right: 10px; border-top: 1px solid var(--accent); border-right: 1px solid var(--accent); }
-  .corner-bl { bottom: 10px; left: 10px; border-bottom: 1px solid var(--accent); border-left: 1px solid var(--accent); }
-  .corner-br { bottom: 10px; right: 10px; border-bottom: 1px solid var(--accent); border-right: 1px solid var(--accent); }
-
-  /* ボトムコントロール */
-  #bottom-ctrl {
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 0 24px 32px;
-    gap: 16px;
-    pointer-events: all;
-  }
-
-  /* パラメーター */
-  #params {
-    display: flex;
-    gap: 24px;
-    align-items: center;
-  }
-
-  .param-group {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-  }
-  .param-label {
-    font-size: 8px;
-    letter-spacing: 0.3em;
-    color: rgba(255,255,255,0.3);
-    text-transform: uppercase;
-  }
-  .param-val {
-    font-size: 13px;
-    color: var(--accent);
-  }
-
-  input[type=range] {
-    -webkit-appearance: none;
-    width: 80px; height: 2px;
-    background: rgba(255,255,255,0.15);
-    outline: none;
-    cursor: pointer;
-  }
-  input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 10px; height: 10px;
-    background: var(--accent);
-    border-radius: 50%;
-    box-shadow: 0 0 8px var(--accent);
-  }
-
-  /* 録画ボタン */
-  #rec-btn {
-    width: 56px; height: 56px;
-    border-radius: 50%;
-    border: 2px solid rgba(255,255,255,0.3);
-    background: transparent;
-    cursor: pointer;
-    position: relative;
-    -webkit-tap-highlight-color: transparent;
-    transition: border-color 0.2s;
-  }
-  #rec-btn::after {
-    content: '';
-    position: absolute;
-    top: 50%; left: 50%;
-    transform: translate(-50%,-50%);
-    width: 20px; height: 20px;
-    background: var(--accent2);
-    border-radius: 50%;
-    transition: all 0.2s;
-    box-shadow: 0 0 16px var(--accent2);
-  }
-  #rec-btn.recording { border-color: var(--accent2); }
-  #rec-btn.recording::after { border-radius: 4px; width: 18px; height: 18px; }
-
-  /* パーミッションオーバーレイ */
-  #perm-overlay {
-    position: absolute;
-    inset: 0;
-    background: #000;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-    gap: 24px;
-  }
-  #perm-overlay h1 {
-    font-family: var(--mono);
-    font-size: clamp(22px, 5vw, 32px);
-    letter-spacing: 0.3em;
-    color: #fff;
-  }
-  #perm-overlay h1 em {
-    color: var(--accent);
-    font-style: normal;
-  }
-  #perm-overlay p {
-    font-size: 11px;
-    letter-spacing: 0.15em;
-    color: rgba(255,255,255,0.4);
-    text-align: center;
-    max-width: 280px;
-    line-height: 2;
-  }
-  #start-btn {
-    margin-top: 8px;
-    background: transparent;
-    border: 1px solid var(--accent);
-    color: var(--accent);
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: 0.4em;
-    padding: 14px 32px;
-    cursor: pointer;
-    text-transform: uppercase;
-    transition: all 0.3s;
-    box-shadow: 0 0 20px rgba(0,255,204,0.15);
-  }
-  #start-btn:hover {
-    background: rgba(0,255,204,0.1);
-    box-shadow: 0 0 30px rgba(0,255,204,0.3);
-  }
-
-  /* ローディング */
-  #loading {
-    position: absolute;
-    inset: 0;
-    background: #000;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    z-index: 99;
-    gap: 16px;
-    display: none;
-  }
-  #loading p { font-size: 10px; letter-spacing: 0.4em; color: var(--accent); }
-  .load-bar {
-    width: 160px; height: 1px;
-    background: rgba(255,255,255,0.1);
-    position: relative;
-    overflow: hidden;
-  }
-  .load-bar::after {
-    content: '';
-    position: absolute;
-    top: 0; left: -100%;
-    width: 100%; height: 100%;
-    background: var(--accent);
-    animation: loadSlide 1.2s ease-in-out infinite;
-  }
-  @keyframes loadSlide { to { left: 200%; } }
-
-  /* スキャンライン */
-  #scanline {
-    position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 2px,
-      rgba(0,0,0,0.08) 2px,
-      rgba(0,0,0,0.08) 4px
-    );
-    pointer-events: none;
-    z-index: 5;
-  }
-
-  /* 手検出インジケーター */
-  #detect-indicator {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    font-size: 10px;
-    letter-spacing: 0.3em;
-    color: rgba(255,255,255,0.2);
-    text-align: center;
-    pointer-events: none;
-    transition: opacity 0.5s;
-  }
-  #detect-indicator.hidden { opacity: 0; }
-
-  /* カメラ切り替えボタン */
-  #flip-btn {
-    width: 44px; height: 44px;
-    border-radius: 50%;
-    border: 1px solid rgba(255,255,255,0.3);
-    background: rgba(255,255,255,0.05);
-    color: rgba(255,255,255,0.7);
-    font-size: 20px;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    -webkit-tap-highlight-color: transparent;
-    transition: all 0.2s;
-  }
-  #flip-btn:active { background: rgba(255,255,255,0.15); }
-
-  /* モード別アクセントカラー */
-  body.mode-trace { --accent: #00ffcc; }
-  body.mode-particle { --accent: #ff2d6b; }
-  body.mode-body { --accent: #7b2fff; }
-</style>
-</head>
-<body class="mode-trace">
-<div id="app">
-  <video id="video" playsinline autoplay muted></video>
-  <canvas id="canvas"></canvas>
-  <div id="scanline"></div>
-
-  <!-- HUD -->
-  <div id="hud">
-    <div class="corner corner-tl"></div>
-    <div class="corner corner-tr"></div>
-    <div class="corner corner-bl"></div>
-    <div class="corner corner-br"></div>
-
-    <div id="header">
-      <div id="logo">
-        RHIZOCAM<br>
-        <span>v0.1</span>
-      </div>
-      <div id="status-panel">
-        FPS: <span class="val" id="fps-val">--</span><br>
-        HANDS: <span class="val" id="hands-val">0</span><br>
-        PARTICLES: <span class="val" id="particle-val">0</span>
-      </div>
-    </div>
-
-    <div id="mode-bar">
-      <button class="mode-btn active" data-mode="trace">TRACE</button>
-      <button class="mode-btn" data-mode="particle">PARTICLE</button>
-      <button class="mode-btn" data-mode="body">BODY</button>
-    </div>
-
-    <div id="detect-indicator">
-      MOVE YOUR HAND<br>INTO FRAME
-    </div>
-
-    <div id="bottom-ctrl">
-      <div id="params">
-        <div class="param-group">
-          <label class="param-label">TRAIL</label>
-          <span class="param-val" id="trail-val">80</span>
-          <input type="range" id="trail-slider" min="10" max="100" value="80">
-        </div>
-        <div class="param-group">
-          <label class="param-label">BURST</label>
-          <span class="param-val" id="burst-val">60</span>
-          <input type="range" id="burst-slider" min="0" max="100" value="60">
-        </div>
-        <div class="param-group">
-          <label class="param-label">GLOW</label>
-          <span class="param-val" id="glow-val">70</span>
-          <input type="range" id="glow-slider" min="0" max="100" value="70">
-        </div>
-      </div>
-      <div style="display:flex;gap:20px;align-items:center;">
-        <button id="flip-btn">⇄</button>
-        <button id="rec-btn"></button>
-      </div>
-    </div>
-  </div>
-
-  <!-- パーミッション画面 -->
-  <div id="perm-overlay">
-    <h1>RHIZO<em>CAM</em></h1>
-    <button id="start-btn">START CAMERA</button>
-  </div>
-
-  <!-- ローディング -->
-  <div id="loading">
-    <p>LOADING MEDIAPIPE</p>
-    <div class="load-bar"></div>
-  </div>
-</div>
-
-<!-- MediaPipe -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-
-<script>
-'use strict';
-
-// ─── 状態 ───────────────────────────────────────────────
-const state = {
-  mode: 'trace',
-  trail: 0.8,
-  burst: 0.6,
-  glow: 0.7,
-  fps: 0,
-  hands: 0,
-  particles: 0,
-  recording: false,
-};
-
-// ─── Canvas セットアップ ──────────────────────────────────
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
-const video = document.getElementById('video');
-
-function resize() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-}
-resize();
-window.addEventListener('resize', resize);
-
-// ─── 粒子システム ─────────────────────────────────────────
-class Particle {
-  constructor(x, y, vx, vy, color, life) {
-    this.x = x; this.y = y;
-    this.vx = vx; this.vy = vy;
-    this.color = color;
-    this.life = life;
-    this.maxLife = life;
-    this.size = Math.random() * 3 + 1;
-  }
-  update() {
-    this.x += this.vx;
-    this.y += this.vy;
-    this.vx *= 0.96;
-    this.vy *= 0.96;
-    this.vy += 0.05; // 重力
-    this.life--;
-  }
-  draw(ctx) {
-    const alpha = this.life / this.maxLife;
-    ctx.save();
-    ctx.globalAlpha = alpha * 0.9;
-    ctx.fillStyle = this.color;
-    ctx.shadowColor = this.color;
-    ctx.shadowBlur = 8;
-    ctx.beginPath();
-    ctx.arc(this.x, this.y, this.size * alpha, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
+  // EUC-JP / Shift_JIS は encoding-japanese で変換（Workers標準TextDecoderは非対応のため）
+  const from = /euc/.test(charset) ? "EUCJP"
+             : /(shift|sjis|s_jis|x-sjis|ms_kanji|windows-31j)/.test(charset) ? "SJIS"
+             : "AUTO";
+  return Encoding.convert(buf, { to: "UNICODE", from, type: "string" });
 }
 
-let particles = [];
+// ============================================================
+// ② レビュー本文の抽出（ハッシュ化クラス名に依存しない方式）
+//   楽天レビューの安定UI文字列「不適切レビュー報告」「ショップからのコメント」で区切る
+// ============================================================
+function decodeEntities(s) {
+  return s
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)));
+}
 
-function spawnParticles(x, y, speed, color, count) {
-  const burst = state.burst;
-  const n = Math.floor(count * burst);
-  for (let i = 0; i < n; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const v = (Math.random() * 4 + 1) * speed;
-    particles.push(new Particle(
-      x, y,
-      Math.cos(angle) * v,
-      Math.sin(angle) * v,
-      color,
-      Math.floor(Math.random() * 40 + 20)
-    ));
+function extractReviews(html) {
+  // script/style/noscript を除去
+  let s = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+
+  // タグをスペースに、HTMLエンティティを復元
+  s = decodeEntities(s.replace(/<[^>]+>/g, " "));
+  s = s.replace(/[ \t\f\v\u00a0]+/g, " ").replace(/ *\n */g, "\n").trim();
+
+  // レビュー一覧の領域に絞る（ヘッダ・公式AI要約・フッタのノイズを落とす）
+  const startIdx = s.indexOf("レビュー一覧");
+  if (startIdx >= 0) s = s.slice(startIdx + "レビュー一覧".length);
+  for (const marker of ["お客様のご意見をお聞かせください", "楽天市場の関連ジャンル", "レビューをご利用になる際"]) {
+    const i = s.indexOf(marker);
+    if (i >= 0) { s = s.slice(0, i); break; }
   }
-  // 最大数制限
-  if (particles.length > 1200) particles = particles.slice(-1200);
+
+  // 「不適切レビュー報告」が各レビューの末尾に1回出るのでそこで分割
+  const blocks = s.split("不適切レビュー報告");
+  const reviews = [];
+  for (let b of blocks) {
+    b = b.trim();
+    if (b.length < 15) continue;
+
+    // ショップ返信は要約対象外 → 「ショップからのコメント」以降を切り落とす
+    const shopIdx = b.indexOf("ショップからのコメント");
+    if (shopIdx >= 0) b = b.slice(0, shopIdx).trim();
+
+    // UI文言のノイズを除去
+    b = b
+      .replace(/さらに表示/g, " ")
+      .replace(/参考になった/g, " ")
+      .replace(/\d+人\s*が参考になったと回答/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (b.length >= 15) reviews.push(b);
+    if (reviews.length >= MAX_REVIEWS) break;
+  }
+  return reviews;
 }
 
-// ─── 軌跡システム ─────────────────────────────────────────
-// 各指先のトレイル
-const FINGER_TIPS = [4, 8, 12, 16, 20]; // 親指〜小指先端
-const COLORS_TRACE = ['#00ffcc', '#00ccff', '#ff2d6b', '#ffcc00', '#7b2fff'];
-const COLORS_PARTICLE = ['#ff2d6b', '#ff6b35', '#ffcc00', '#ff0099', '#ff4500'];
-const COLORS_BODY = ['#7b2fff', '#00ccff', '#2fff7b', '#ff2fff', '#2f7bff'];
-
-const trails = {}; // landmarkIndex -> [{x,y,t}]
-const TRAIL_MAX = 60;
-
-function getColors() {
-  if (state.mode === 'trace') return COLORS_TRACE;
-  if (state.mode === 'particle') return COLORS_PARTICLE;
-  return COLORS_BODY;
+// ============================================================
+// ③ ページ番号を差し替えて複数ページ収集
+//   URL例: https://review.rakuten.co.jp/item/1/270424_10048681/1.1/
+//          末尾の「1.1」= ページ番号.ソート種別
+// ============================================================
+function buildPageUrl(baseUrl, page) {
+  return baseUrl.replace(/\/(\d+)\.(\d+)\/?$/, `/${page}.$2/`);
 }
 
-// ─── 座標変換（ミラー反転） ───────────────────────────────
-function lmToCanvas(lm) {
-  // MediaPipeは正規化座標(0-1)。カメラを鏡反転
+async function collectReviews(baseUrl) {
+  const all = [];
+  for (let p = 1; p <= MAX_PAGES; p++) {
+    const pageUrl = buildPageUrl(baseUrl, p);
+    try {
+      const html = await fetchHtmlSmart(pageUrl);
+      const rv = extractReviews(html);
+      if (rv.length === 0) break; // これ以上ページがない
+      all.push(...rv);
+      if (all.length >= MAX_REVIEWS) break;
+    } catch (e) {
+      if (p === 1) throw e; // 1ページ目の失敗は致命的
+      break;                // 2ページ目以降の失敗は無視して続行
+    }
+  }
+  return all.slice(0, MAX_REVIEWS);
+}
+
+// ============================================================
+// ④ Workers AI で要約（メリット/デメリット/改善点をJSONで）
+// ============================================================
+function safeJsonParse(text) {
+  if (!text) return null;
+  // コードブロックの除去＋最初の { 〜 最後の } を抽出
+  let t = String(text).replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) t = t.slice(start, end + 1);
+  try { return JSON.parse(t); } catch { return null; }
+}
+
+async function summarizeReviews(env, reviewText) {
+  const system = `あなたは家具ECの商品分析アシスタントです。与えられた楽天市場の商品レビュー本文を分析し、必ず下記スキーマのJSONのみを日本語で出力してください。前置き・後置き・コードブロック・説明文は一切出力しないこと。
+
+スキーマ:
+{
+  "merits": ["顧客が満足している点・良かった点を5〜8個"],
+  "demerits": ["不満点・悪かった点を3〜6個。なければ空配列[]"],
+  "improvements": ["商品開発・改良に活かせる具体的な改善提案を3〜6個。『何が問題か→どう直すか』をセットで"]
+}
+
+ルール:
+- レビュー本文に書かれている事実のみを根拠にする。推測で水増ししない。
+- 同じ趣旨の声は1項目にまとめ、言及の多い順に並べる。
+- 各項目は簡潔な日本語1文にする。`;
+
+  const user = `次の商品レビューを分析してJSONで出力してください。\n\n${reviewText}`;
+
+  const resp = await env.AI.run(AI_MODEL, {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: 1024,
+    temperature: 0.2,
+  });
+
+  const parsed = safeJsonParse(resp?.response);
+  if (!parsed) {
+    // モデルがJSONを崩した場合のフォールバック（生テキストを返す）
+    return { merits: [], demerits: [], improvements: [], _raw: resp?.response ?? "" };
+  }
   return {
-    x: (1 - lm.x) * canvas.width,
-    y: lm.y * canvas.height,
-    z: lm.z,
+    merits: Array.isArray(parsed.merits) ? parsed.merits : [],
+    demerits: Array.isArray(parsed.demerits) ? parsed.demerits : [],
+    improvements: Array.isArray(parsed.improvements) ? parsed.improvements : [],
   };
 }
 
-// ─── 描画メイン ───────────────────────────────────────────
-let lastFrameTime = performance.now();
-let frameCount = 0;
-let lastFpsTime = performance.now();
-
-function drawFrame(handsResults) {
-  const now = performance.now();
-  frameCount++;
-  if (now - lastFpsTime > 500) {
-    state.fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
-    frameCount = 0;
-    lastFpsTime = now;
-    document.getElementById('fps-val').textContent = state.fps;
-  }
-
-  const W = canvas.width, H = canvas.height;
-
-  // ──── 背景：fade（軌跡のため完全消去しない）
-  ctx.fillStyle = `rgba(0,0,0,${state.mode === 'trace' ? 0.18 : 0.22})`;
-  ctx.fillRect(0, 0, W, H);
-
-  // カメラ映像を薄く投影
-  if (video.readyState >= 2) {
-    ctx.save();
-    ctx.globalAlpha = 0.18;
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1); // 鏡
-    ctx.drawImage(video, 0, 0, W, H);
-    ctx.restore();
-  }
-
-  // ──── 粒子更新・描画
-  particles = particles.filter(p => p.life > 0);
-  particles.forEach(p => { p.update(); p.draw(ctx); });
-  state.particles = particles.length;
-  document.getElementById('particle-val').textContent = state.particles;
-
-  if (!handsResults || !handsResults.multiHandLandmarks) {
-    state.hands = 0;
-    document.getElementById('hands-val').textContent = 0;
-    document.getElementById('detect-indicator').classList.remove('hidden');
-    return;
-  }
-
-  const hands = handsResults.multiHandLandmarks;
-  state.hands = hands.length;
-  document.getElementById('hands-val').textContent = hands.length;
-  document.getElementById('detect-indicator').classList.toggle('hidden', hands.length > 0);
-
-  const colors = getColors();
-
-  hands.forEach((landmarks, hi) => {
-    // ─── 手のひらスケルトン描画（Bodyモード中心）
-    if (state.mode === 'body') {
-      drawSkeleton(landmarks, colors[hi % colors.length]);
-    }
-
-    // ─── 指先トレイル & 粒子
-    FINGER_TIPS.forEach((tipIdx, fi) => {
-      const lm = landmarks[tipIdx];
-      const pos = lmToCanvas(lm);
-      const key = `${hi}_${tipIdx}`;
-      const color = colors[fi % colors.length];
-
-      if (!trails[key]) trails[key] = [];
-      const trail = trails[key];
-
-      // 速度計算
-      let speed = 0;
-      if (trail.length > 0) {
-        const prev = trail[trail.length - 1];
-        const dx = pos.x - prev.x;
-        const dy = pos.y - prev.y;
-        speed = Math.sqrt(dx * dx + dy * dy);
-      }
-
-      trail.push({ x: pos.x, y: pos.y, t: now, speed });
-      // 古いもの削除
-      const cutoff = now - TRAIL_MAX * 16;
-      while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
-      if (trail.length > TRAIL_MAX) trail.shift();
-
-      // 粒子バースト（動きが速いとき）
-      if (speed > 8 && state.burst > 0.1) {
-        const count = Math.min(12, Math.floor(speed * 0.4));
-        spawnParticles(pos.x, pos.y, speed * 0.05, color, count);
-      }
-
-      // ─── 軌跡描画
-      if (trail.length < 2) return;
-
-      if (state.mode === 'trace' || state.mode === 'body') {
-        drawTrail(trail, color, state.glow);
-      } else if (state.mode === 'particle') {
-        drawParticleTrail(trail, color, state.glow);
-      }
-
-      // 指先グロー
-      drawTip(pos.x, pos.y, color, speed, state.glow);
+// ============================================================
+// ⑤ ルートハンドラ（既存 fetch から呼ぶ）
+// ============================================================
+export async function handleSummarizeReview(request, env) {
+  const json = (obj, status = 200) =>
+    new Response(JSON.stringify(obj), {
+      status,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
     });
-
-    // ─── 手のひら中心の装飾
-    drawPalmDecor(landmarks, colors[hi % colors.length], state.mode);
-  });
-
-  // ─── スキャンライン風グリッチ（低確率）
-  if (Math.random() < 0.003) {
-    const y = Math.random() * H;
-    ctx.save();
-    ctx.globalAlpha = 0.3;
-    ctx.fillStyle = 'rgba(0,255,204,0.15)';
-    ctx.fillRect(0, y, W, 1 + Math.random() * 3);
-    ctx.restore();
-  }
-}
-
-function drawTrail(trail, color, glow) {
-  ctx.save();
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-
-  const glowAmt = glow * 20;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = glowAmt;
-
-  ctx.beginPath();
-  ctx.moveTo(trail[0].x, trail[0].y);
-  for (let i = 1; i < trail.length; i++) {
-    const t = i / trail.length;
-    const width = t * 3 * (1 + (trail[i].speed || 0) * 0.02);
-    ctx.lineWidth = width;
-    ctx.strokeStyle = colorWithAlpha(color, t * 0.9);
-    ctx.beginPath();
-    ctx.moveTo(trail[i-1].x, trail[i-1].y);
-    ctx.lineTo(trail[i].x, trail[i].y);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function drawParticleTrail(trail, color, glow) {
-  // 粒子モードは点の連なり
-  ctx.save();
-  ctx.shadowColor = color;
-  ctx.shadowBlur = glow * 15;
-  trail.forEach((pt, i) => {
-    const t = i / trail.length;
-    const size = t * 4 + 0.5;
-    ctx.globalAlpha = t * 0.7;
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(pt.x, pt.y, size, 0, Math.PI * 2);
-    ctx.fill();
-  });
-  ctx.restore();
-}
-
-function drawTip(x, y, color, speed, glow) {
-  const r = 4 + speed * 0.1;
-  ctx.save();
-  ctx.shadowColor = color;
-  ctx.shadowBlur = glow * 30;
-  // 中心グロー
-  const g = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
-  g.addColorStop(0, colorWithAlpha(color, 0.9));
-  g.addColorStop(0.4, colorWithAlpha(color, 0.3));
-  g.addColorStop(1, 'transparent');
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.arc(x, y, r * 3, 0, Math.PI * 2);
-  ctx.fill();
-  // コア
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  ctx.arc(x, y, 2.5, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-}
-
-function drawSkeleton(landmarks, color) {
-  // 手の骨格接続定義
-  const connections = [
-    [0,1],[1,2],[2,3],[3,4],       // 親指
-    [0,5],[5,6],[6,7],[7,8],       // 人差し指
-    [0,9],[9,10],[10,11],[11,12],  // 中指
-    [0,13],[13,14],[14,15],[15,16],// 薬指
-    [0,17],[17,18],[18,19],[19,20],// 小指
-    [5,9],[9,13],[13,17],          // 手のひら横
-  ];
-
-  ctx.save();
-  ctx.strokeStyle = colorWithAlpha(color, 0.35);
-  ctx.lineWidth = 1;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 8;
-
-  connections.forEach(([a, b]) => {
-    const pa = lmToCanvas(landmarks[a]);
-    const pb = lmToCanvas(landmarks[b]);
-    ctx.beginPath();
-    ctx.moveTo(pa.x, pa.y);
-    ctx.lineTo(pb.x, pb.y);
-    ctx.stroke();
-  });
-
-  // ランドマーク点
-  landmarks.forEach((lm, i) => {
-    const p = lmToCanvas(lm);
-    ctx.globalAlpha = 0.6;
-    ctx.fillStyle = FINGER_TIPS.includes(i) ? '#fff' : colorWithAlpha(color, 0.5);
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, FINGER_TIPS.includes(i) ? 3 : 1.5, 0, Math.PI * 2);
-    ctx.fill();
-  });
-  ctx.restore();
-}
-
-function drawPalmDecor(landmarks, color, mode) {
-  // 手のひら中心（ランドマーク9周辺）
-  const wrist = lmToCanvas(landmarks[0]);
-  const mid = lmToCanvas(landmarks[9]);
-  const cx = (wrist.x + mid.x) / 2;
-  const cy = (wrist.y + mid.y) / 2;
-
-  if (mode === 'trace') {
-    // 手のひらに六角形スキャン
-    ctx.save();
-    ctx.strokeStyle = colorWithAlpha(color, 0.15);
-    ctx.lineWidth = 0.5;
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 5;
-    const r = 30 + Math.sin(Date.now() * 0.003) * 5;
-    ctx.beginPath();
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2 - Math.PI / 6;
-      const x = cx + Math.cos(a) * r;
-      const y = cy + Math.sin(a) * r;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.stroke();
-    ctx.restore();
-  } else if (mode === 'particle') {
-    // パルス円
-    const t = (Date.now() % 1000) / 1000;
-    const pr = t * 60;
-    ctx.save();
-    ctx.globalAlpha = (1 - t) * 0.3;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(cx, cy, pr, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-  }
-}
-
-function colorWithAlpha(hex, alpha) {
-  const r = parseInt(hex.slice(1,3), 16);
-  const g = parseInt(hex.slice(3,5), 16);
-  const b = parseInt(hex.slice(5,7), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
-
-// ─── MediaPipe セットアップ ────────────────────────────────
-let handsInstance = null;
-let latestResults = null;
-let animId = null;
-let currentFacing = 'user'; // 'user'=内カメラ / 'environment'=外カメラ
-let currentStream = null;
-let mpCamera = null;
-let initialized = false;
-
-function renderLoop() {
-  drawFrame(latestResults);
-  animId = requestAnimationFrame(renderLoop);
-}
-
-async function startCamera(facingMode) {
-  // 既存ストリームを停止
-  if (currentStream) {
-    currentStream.getTracks().forEach(t => t.stop());
-    currentStream = null;
-  }
-  if (mpCamera) {
-    mpCamera.stop();
-    mpCamera = null;
-  }
-
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
-    audio: false,
-  });
-  currentStream = stream;
-  video.srcObject = stream;
-  await new Promise(r => { video.onloadedmetadata = r; });
-  video.play();
-
-  // 軌跡リセット
-  Object.keys(trails).forEach(k => delete trails[k]);
-  particles.length = 0;
-
-  mpCamera = new Camera(video, {
-    onFrame: async () => {
-      if (handsInstance) await handsInstance.send({ image: video });
-    },
-    width: 1280, height: 720,
-  });
-  mpCamera.start();
-}
-
-async function initMediaPipe() {
-  document.getElementById('perm-overlay').style.display = 'none';
-  document.getElementById('loading').style.display = 'flex';
 
   try {
-    await startCamera(currentFacing);
-  } catch(e) {
-    alert('カメラへのアクセスが必要です: ' + e.message);
-    document.getElementById('perm-overlay').style.display = 'flex';
-    document.getElementById('loading').style.display = 'none';
-    return;
-  }
+    const reqUrl = new URL(request.url);
+    const target = reqUrl.searchParams.get("url");
+    if (!target) return json({ ok: false, error: "url パラメータが必要です" }, 400);
 
-  if (!initialized) {
-    // Hands 初期化（一度だけ）
-    handsInstance = new Hands({
-      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
+    // --- SSRF対策: 楽天レビューのドメインのみ許可 ---
+    let parsed;
+    try { parsed = new URL(target); } catch { return json({ ok: false, error: "URLが不正です" }, 400); }
+    if (parsed.hostname !== "review.rakuten.co.jp") {
+      return json({ ok: false, error: "review.rakuten.co.jp のURLのみ対応しています" }, 400);
+    }
+
+    const reviews = await collectReviews(target);
+    if (reviews.length === 0) {
+      return json({ ok: false, error: "レビュー本文を抽出できませんでした" }, 422);
+    }
+
+    // トークン予算内に収める（先頭=新しい順から詰める）
+    let text = "";
+    let used = 0;
+    for (const r of reviews) {
+      if (used + r.length > REVIEW_CHAR_LIMIT) break;
+      text += "・" + r + "\n";
+      used += r.length;
+    }
+
+    const summary = await summarizeReviews(env, text);
+
+    return json({
+      ok: true,
+      source: target,
+      reviewCountUsed: text.split("\n").filter(Boolean).length,
+      summary, // { merits, demerits, improvements }
     });
-    handsInstance.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.6,
-    });
-    handsInstance.onResults(results => { latestResults = results; });
-    initialized = true;
-    renderLoop();
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 500);
   }
-
-  document.getElementById('loading').style.display = 'none';
 }
-
-// ─── UI イベント ──────────────────────────────────────────
-document.getElementById('start-btn').addEventListener('click', initMediaPipe);
-
-// カメラ切り替え
-document.getElementById('flip-btn').addEventListener('click', async () => {
-  if (!initialized) return;
-  currentFacing = currentFacing === 'user' ? 'environment' : 'user';
-  latestResults = null;
-  try {
-    await startCamera(currentFacing);
-  } catch(e) {
-    // 切り替え失敗時は元に戻す
-    currentFacing = currentFacing === 'user' ? 'environment' : 'user';
-    await startCamera(currentFacing);
-  }
-});
-
-// モードボタン
-document.querySelectorAll('.mode-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    state.mode = btn.dataset.mode;
-    document.body.className = `mode-${state.mode}`;
-    // 軌跡リセット
-    Object.keys(trails).forEach(k => delete trails[k]);
-    particles.length = 0;
-  });
-});
-
-// スライダー
-function setupSlider(id, valId, stateKey, transform) {
-  const slider = document.getElementById(id);
-  const valEl = document.getElementById(valId);
-  slider.addEventListener('input', () => {
-    const v = parseInt(slider.value);
-    valEl.textContent = v;
-    state[stateKey] = transform(v);
-  });
-}
-setupSlider('trail-slider', 'trail-val', 'trail', v => v / 100);
-setupSlider('burst-slider', 'burst-val', 'burst', v => v / 100);
-setupSlider('glow-slider', 'glow-val', 'glow', v => v / 100);
-
-// 録画ボタン（表示だけ）
-document.getElementById('rec-btn').addEventListener('click', function() {
-  this.classList.toggle('recording');
-  state.recording = !state.recording;
-});
-
-// クリーンアップ
-window.addEventListener('beforeunload', () => {
-  if (animId) cancelAnimationFrame(animId);
-});
-</script>
-</body>
-</html>
